@@ -230,29 +230,22 @@ static bool wiphy_can_connect_sae(struct wiphy *wiphy)
 	 *    cards the entire SAE protocol as well as the subsequent 4-way
 	 *    handshake are all done in the driver/firmware (fullMAC).
 	 *
-	 * 3. TODO: Cards which allow SAE in userspace via CMD_EXTERNAL_AUTH.
+	 * 3. Cards which allow SAE in userspace via CMD_EXTERNAL_AUTH.
 	 *    These cards do not support AUTH/ASSOC commands but do implement
 	 *    CMD_EXTERNAL_AUTH which is supposed to allow userspace to
-	 *    generate Authenticate frames as it would for case (1). As it
-	 *    stands today only one driver actually uses CMD_EXTERNAL_AUTH and
-	 *    for now IWD will not allow connections to SAE networks using this
-	 *    mechanism.
+	 *    generate Authenticate frames as it would for case (1).
 	 */
-
 	if (wiphy_has_feature(wiphy, NL80211_FEATURE_SAE)) {
 		/* Case (1) */
 		if (wiphy->support_cmds_auth_assoc)
 			return true;
 
-		/*
-		 * Case (3)
-		 *
-		 * TODO: No support for CMD_EXTERNAL_AUTH yet.
-		 */
-		l_warn("SAE unsupported: %s needs CMD_EXTERNAL_AUTH for SAE",
+		/* Case 3 */
+		iwd_notice(IWD_NOTICE_CONNECT_INFO,
+			"FullMAC driver: %s using SAE.  Expect EXTERNAL_AUTH",
 			wiphy->driver_str);
 
-		return false;
+		return true;
 	}
 
 	/* Case (2) */

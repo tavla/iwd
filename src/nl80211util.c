@@ -648,7 +648,9 @@ struct l_genl_msg *nl80211_build_cmd_frame(uint32_t ifindex,
 	msg = l_genl_msg_new_sized(NL80211_CMD_FRAME, 128 + 512);
 
 	l_genl_msg_append_attr(msg, NL80211_ATTR_IFINDEX, 4, &ifindex);
-	l_genl_msg_append_attr(msg, NL80211_ATTR_WIPHY_FREQ, 4, &freq);
+
+	if (freq)
+		l_genl_msg_append_attr(msg, NL80211_ATTR_WIPHY_FREQ, 4, &freq);
 	l_genl_msg_append_attrv(msg, NL80211_ATTR_FRAME, iovs, iov_len + 1);
 
 	return msg;

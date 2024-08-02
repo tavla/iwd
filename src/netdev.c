@@ -192,6 +192,7 @@ struct netdev {
 	bool in_reassoc : 1;
 	bool privacy : 1;
 	bool cqm_poll_fallback : 1;
+	bool external_auth : 1;
 };
 
 struct netdev_preauth_state {
@@ -871,6 +872,7 @@ static void netdev_connect_free(struct netdev *netdev)
 	netdev->expect_connect_failure = false;
 	netdev->cur_rssi_low = false;
 	netdev->privacy = false;
+	netdev->external_auth = false;
 
 	if (netdev->connect_cmd) {
 		l_genl_msg_unref(netdev->connect_cmd);
@@ -2478,7 +2480,10 @@ static struct l_genl_msg *netdev_build_cmd_connect(struct netdev *netdev,
 
 	switch (nhs->type) {
 	case CONNECTION_TYPE_SOFTMAC:
+		break;
 	case CONNECTION_TYPE_FULLMAC:
+		l_genl_msg_append_attr(msg,
+				NL80211_ATTR_EXTERNAL_AUTH_SUPPORT, 0, NULL);
 		break;
 	case CONNECTION_TYPE_SAE_OFFLOAD:
 		l_genl_msg_append_attr(msg, NL80211_ATTR_SAE_PASSWORD,
@@ -3392,6 +3397,77 @@ static void netdev_fils_tx_associate(struct iovec *fils_iov, size_t n_fils_iov,
 	}
 }
 
+static void netdev_external_auth_frame_cb(struct l_genl_msg *msg,
+							void *user_data)
+{
+	int error = l_genl_msg_get_error(msg);
+
+	if (error < 0)
+		l_debug("Failed to send External Auth Frame: %s(%d)",
+				strerror(-error), -error);
+}
+
+static void netdev_external_auth_sae_tx_authenticate(const uint8_t *body,
+					size_t body_len, void *user_data)
+{
+	struct netdev *netdev = user_data;
+	struct handshake_state *hs = netdev->handshake;
+	uint16_t frame_type = MPDU_MANAGEMENT_SUBTYPE_AUTHENTICATION << 4;
+	struct iovec iov[2];
+	struct l_genl_msg *msg;
+	uint8_t algorithm[2] = { 0x03, 0x00 };
+
+	l_debug("");
+
+	iov[0].iov_base = &algorithm;
+	iov[0].iov_len = sizeof(algorithm);
+	iov[1].iov_base = (void *) body;
+	iov[1].iov_len = body_len;
+
+	msg = nl80211_build_cmd_frame(netdev->index, frame_type,
+					hs->spa, hs->aa, 0, iov, 2);
+
+	if (l_genl_family_send(nl80211, msg, netdev_external_auth_frame_cb,
+				netdev, NULL) > 0)
+		return;
+
+	l_genl_msg_unref(msg);
+}
+
+static void netdev_external_auth_cb(struct l_genl_msg *msg, void *user_data)
+{
+	int error = l_genl_msg_get_error(msg);
+
+	if (error < 0)
+		l_debug("Failed to send External Auth: %s(%d)",
+				strerror(-error), -error);
+}
+
+static void netdev_send_external_auth(struct netdev *netdev,
+							uint16_t status_code)
+{
+	struct handshake_state *hs = netdev->handshake;
+	struct l_genl_msg *msg =
+		nl80211_build_external_auth(netdev->index, status_code,
+						hs->ssid, hs->ssid_len, hs->aa);
+
+	if (l_genl_family_send(nl80211, msg, netdev_external_auth_cb,
+				netdev, NULL) > 0)
+		return;
+
+	l_genl_msg_unref(msg);
+}
+
+static void netdev_external_auth_sae_tx_associate(void *user_data)
+{
+	struct netdev *netdev = user_data;
+
+	l_debug("");
+
+	netdev_send_external_auth(netdev, MMPDU_STATUS_CODE_SUCCESS);
+	netdev_ensure_eapol_registered(netdev);
+}
+
 struct rtnl_data {
 	struct netdev *netdev;
 	uint8_t addr[ETH_ALEN];
@@ -3400,6 +3476,10 @@ struct rtnl_data {
 
 static int netdev_begin_connection(struct netdev *netdev)
 {
+	struct netdev_handshake_state *nhs =
+		l_container_of(netdev->handshake,
+				struct netdev_handshake_state, super);
+
 	if (netdev->connect_cmd) {
 		netdev->connect_cmd_id = l_genl_family_send(nl80211,
 						netdev->connect_cmd,
@@ -3419,7 +3499,7 @@ static int netdev_begin_connection(struct netdev *netdev)
 	 */
 	handshake_state_set_supplicant_address(netdev->handshake, netdev->addr);
 
-	if (netdev->ap) {
+	if (netdev->ap && nhs->type == CONNECTION_TYPE_SOFTMAC) {
 		if (!auth_proto_start(netdev->ap))
 			goto failed;
 
@@ -3870,7 +3950,11 @@ static int netdev_handshake_state_setup_connection_type(
 		if (softmac && wiphy_has_feature(wiphy, NL80211_FEATURE_SAE))
 			goto softmac;
 
-		return -EINVAL;
+		/* FullMAC uses EXTERNAL_AUTH and reuses this feature bit */
+		if (wiphy_has_feature(wiphy, NL80211_FEATURE_SAE))
+			goto fullmac;
+
+		return -ENOTSUP;
 	case IE_RSN_AKM_SUITE_FILS_SHA256:
 	case IE_RSN_AKM_SUITE_FILS_SHA384:
 	case IE_RSN_AKM_SUITE_FT_OVER_FILS_SHA256:
@@ -3941,40 +4025,43 @@ static void netdev_connect_common(struct netdev *netdev,
 		goto done;
 	}
 
-	if (nhs->type != CONNECTION_TYPE_SOFTMAC)
+	if (!IE_AKM_IS_SAE(hs->akm_suite) ||
+				nhs->type == CONNECTION_TYPE_SAE_OFFLOAD)
 		goto build_cmd_connect;
 
-	switch (hs->akm_suite) {
-	case IE_RSN_AKM_SUITE_SAE_SHA256:
-	case IE_RSN_AKM_SUITE_FT_OVER_SAE_SHA256:
+	if (nhs->type == CONNECTION_TYPE_SOFTMAC)
 		netdev->ap = sae_sm_new(hs, netdev_sae_tx_authenticate,
-						netdev_sae_tx_associate,
-						netdev);
+					netdev_sae_tx_associate,
+					netdev);
+	else
+		netdev->ap =
+			sae_sm_new(hs, netdev_external_auth_sae_tx_authenticate,
+					netdev_external_auth_sae_tx_associate,
+					netdev);
 
-		if (sae_sm_is_h2e(netdev->ap)) {
-			uint8_t own_rsnxe[20];
+	if (sae_sm_is_h2e(netdev->ap)) {
+		uint8_t own_rsnxe[20];
 
-			if (wiphy_get_rsnxe(netdev->wiphy,
-					own_rsnxe, sizeof(own_rsnxe))) {
-				set_bit(own_rsnxe + 2, IE_RSNX_SAE_H2E);
-				handshake_state_set_supplicant_rsnxe(hs,
-								own_rsnxe);
-			}
-		}
-
-		break;
-	default:
-build_cmd_connect:
-		cmd_connect = netdev_build_cmd_connect(netdev, hs, prev_bssid);
-
-		if (!is_offload(hs) && (is_rsn || hs->settings_8021x)) {
-			sm = eapol_sm_new(hs);
-
-			if (nhs->type == CONNECTION_TYPE_8021X_OFFLOAD)
-				eapol_sm_set_require_handshake(sm, false);
+		if (wiphy_get_rsnxe(netdev->wiphy,
+				own_rsnxe, sizeof(own_rsnxe))) {
+			set_bit(own_rsnxe + 2, IE_RSNX_SAE_H2E);
+			handshake_state_set_supplicant_rsnxe(hs,
+							own_rsnxe);
 		}
 	}
 
+	if (nhs->type == CONNECTION_TYPE_SOFTMAC)
+		goto done;
+
+build_cmd_connect:
+	cmd_connect = netdev_build_cmd_connect(netdev, hs, prev_bssid);
+
+	if (!is_offload(hs) && (is_rsn || hs->settings_8021x)) {
+		sm = eapol_sm_new(hs);
+
+		if (nhs->type == CONNECTION_TYPE_8021X_OFFLOAD)
+			eapol_sm_set_require_handshake(sm, false);
+	}
 done:
 	netdev->connect_cmd = cmd_connect;
 	netdev->event_filter = event_filter;
@@ -4481,6 +4568,52 @@ static void netdev_qos_map_frame_event(const struct mmpdu_header *hdr,
 		return;
 
 	netdev_send_qos_map_set(netdev, body + 4, body_len - 4);
+}
+
+static void netdev_sae_external_auth_frame_event(const struct mmpdu_header *hdr,
+					const void *body, size_t body_len,
+					int rssi, void *user_data)
+{
+	struct netdev *netdev = user_data;
+	const struct mmpdu_authentication *auth;
+	uint16_t status_code = MMPDU_STATUS_CODE_UNSPECIFIED;
+	int ret;
+
+	if (!netdev->external_auth)
+		return;
+
+	if (!netdev->ap)
+		return;
+
+	auth = mmpdu_body(hdr);
+	/*
+	 * Allows station to persist settings so it does not retry
+	 * the higher order ECC group again
+	 */
+	if (L_CPU_TO_LE16(auth->status) ==
+			MMPDU_STATUS_CODE_UNSUPP_FINITE_CYCLIC_GROUP &&
+			netdev->event_filter)
+		netdev->event_filter(netdev, NETDEV_EVENT_ECC_GROUP_RETRY,
+					NULL, netdev->user_data);
+
+	ret = auth_proto_rx_authenticate(netdev->ap, (const void *) hdr,
+					mmpdu_header_len(hdr) + body_len);
+
+	switch (ret) {
+	case 0:
+	case -EAGAIN:
+		return;
+	case -ENOMSG:
+	case -EBADMSG:
+		return;
+	default:
+		break;
+	}
+
+	if (ret > 0)
+		status_code = (uint16_t)ret;
+
+	netdev_send_external_auth(netdev, status_code);
 }
 
 static void netdev_preauth_cb(const uint8_t *pmk, void *user_data)
@@ -5307,6 +5440,63 @@ static void netdev_control_port_frame_event(struct l_genl_msg *msg,
 						frame, frame_len, unencrypted);
 }
 
+static void netdev_external_auth_event(struct l_genl_msg *msg,
+							struct netdev *netdev)
+{
+	const uint8_t *bssid;
+	struct iovec ssid;
+	uint32_t akm;
+	uint32_t action;
+	struct handshake_state *hs = netdev->handshake;
+
+	if (L_WARN_ON(nl80211_parse_attrs(msg, NL80211_ATTR_AKM_SUITES, &akm,
+				NL80211_ATTR_EXTERNAL_AUTH_ACTION, &action,
+				NL80211_ATTR_BSSID, &bssid,
+				NL80211_ATTR_SSID, &ssid,
+				NL80211_ATTR_UNSPEC) < 0))
+		return;
+
+	if (!L_IN_SET(action, NL80211_EXTERNAL_AUTH_START,
+				NL80211_EXTERNAL_AUTH_ABORT))
+		return;
+
+	/* kernel sends SAE_SHA256 AKM in BE order for legacy reasons */
+	if (!L_IN_SET(akm, CRYPTO_AKM_SAE_SHA256, CRYPTO_AKM_FT_OVER_SAE_SHA256,
+				L_CPU_TO_BE32(CRYPTO_AKM_SAE_SHA256))) {
+		l_warn("Unknown AKM: %08x", akm);
+		return;
+	}
+
+	if (action == NL80211_EXTERNAL_AUTH_ABORT) {
+		iwd_notice(IWD_NOTICE_CONNECT_INFO, "External Auth Aborted");
+		goto error;
+	}
+
+	iwd_notice(IWD_NOTICE_CONNECT_INFO,
+			"External Auth to SSID: %s, bssid: "MAC,
+			util_ssid_to_utf8(ssid.iov_len, ssid.iov_base),
+			MAC_STR(bssid));
+
+	if (hs->ssid_len != ssid.iov_len ||
+			memcmp(hs->ssid, ssid.iov_base, hs->ssid_len)) {
+		iwd_notice(IWD_NOTICE_CONNECT_INFO, "Target SSID mismatch");
+		goto error;
+	}
+
+	if (memcmp(hs->aa, bssid, ETH_ALEN)) {
+		iwd_notice(IWD_NOTICE_CONNECT_INFO, "Target BSSID mismatch");
+		goto error;
+	}
+
+	if (auth_proto_start(netdev->ap)) {
+		netdev->external_auth = true;
+		return;
+	}
+
+error:
+	netdev_send_external_auth(netdev, MMPDU_STATUS_CODE_UNSPECIFIED);
+}
+
 static void netdev_unicast_notify(struct l_genl_msg *msg, void *user_data)
 {
 	struct netdev *netdev = NULL;
@@ -5343,6 +5533,9 @@ static void netdev_unicast_notify(struct l_genl_msg *msg, void *user_data)
 	switch (cmd) {
 	case NL80211_CMD_CONTROL_PORT_FRAME:
 		netdev_control_port_frame_event(msg, netdev);
+		break;
+	case NL80211_CMD_EXTERNAL_AUTH:
+		netdev_external_auth_event(msg, netdev);
 		break;
 	}
 }
@@ -5518,6 +5711,7 @@ static void netdev_add_station_frame_watches(struct netdev *netdev)
 	static const uint8_t action_ft_response_prefix[] =  { 0x06, 0x02 };
 	static const uint8_t auth_ft_response_prefix[] = { 0x02, 0x00 };
 	static const uint8_t action_qos_map_prefix[] = { 0x01, 0x04 };
+	static const uint8_t auth_sae_prefix[] = { 0x03, 0x00 };
 	uint64_t wdev = netdev->wdev_id;
 
 	/* Subscribe to Management -> Action -> RM -> Neighbor Report frames */
@@ -5545,6 +5739,13 @@ static void netdev_add_station_frame_watches(struct netdev *netdev)
 		frame_watch_add(wdev, 0, 0x00d0, action_qos_map_prefix,
 				sizeof(action_qos_map_prefix),
 				netdev_qos_map_frame_event, netdev, NULL);
+
+	if (!wiphy_supports_cmds_auth_assoc(netdev->wiphy) &&
+			wiphy_has_feature(netdev->wiphy, NL80211_FEATURE_SAE))
+		frame_watch_add(wdev, 0, 0x00b0,
+				auth_sae_prefix, sizeof(auth_sae_prefix),
+				netdev_sae_external_auth_frame_event,
+				netdev, NULL);
 }
 
 static void netdev_setup_interface(struct netdev *netdev)

@@ -1550,6 +1550,26 @@ struct auth_proto *sae_sm_new(struct handshake_state *hs,
 	return &sm->ap;
 }
 
+bool sae_sm_force_hunt_and_peck(struct auth_proto *ap)
+{
+	struct sae_sm *sm = l_container_of(ap, struct sae_sm, ap);
+
+	sae_debug("Forcing SAE Hunting and Pecking");
+	sm->sae_type = CRYPTO_SAE_LOOPING;
+
+	return true;
+}
+
+bool sae_sm_force_default_group(struct auth_proto *ap)
+{
+	struct sae_sm *sm = l_container_of(ap, struct sae_sm, ap);
+
+	sae_debug("Forcing Default Group");
+	sm->force_default_group = true;
+
+	return true;
+}
+
 static int sae_init(void)
 {
 	if (getenv("IWD_SAE_DEBUG"))

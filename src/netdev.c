@@ -4033,11 +4033,14 @@ static void netdev_connect_common(struct netdev *netdev,
 		netdev->ap = sae_sm_new(hs, netdev_sae_tx_authenticate,
 					netdev_sae_tx_associate,
 					netdev);
-	else
+	else {
 		netdev->ap =
 			sae_sm_new(hs, netdev_external_auth_sae_tx_authenticate,
 					netdev_external_auth_sae_tx_associate,
 					netdev);
+		sae_sm_force_default_group(netdev->ap);
+		sae_sm_force_hunt_and_peck(netdev->ap);
+	}
 
 	if (sae_sm_is_h2e(netdev->ap)) {
 		uint8_t own_rsnxe[20];

@@ -602,7 +602,7 @@ static bool netdev_parse_sta_info(struct l_genl_attr *attr,
 			if (!netdev_parse_bitrate(&nested, &info->rx_mcs_type,
 							&info->rx_bitrate,
 							&info->rx_mcs))
-				return false;
+				continue;
 
 			info->have_rx_bitrate = true;
 
@@ -618,7 +618,7 @@ static bool netdev_parse_sta_info(struct l_genl_attr *attr,
 			if (!netdev_parse_bitrate(&nested, &info->tx_mcs_type,
 							&info->tx_bitrate,
 							&info->tx_mcs))
-				return false;
+				continue;
 
 			info->have_tx_bitrate = true;
 

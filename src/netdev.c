@@ -769,11 +769,12 @@ static void netdev_rssi_poll(struct l_timeout *timeout, void *user_data)
 /* To be called whenever operational or rssi_levels_num are updated */
 static void netdev_rssi_polling_update(struct netdev *netdev)
 {
-	if (wiphy_has_ext_feature(netdev->wiphy,
+	if (!netdev->cqm_poll_fallback && wiphy_has_ext_feature(netdev->wiphy,
 					NL80211_EXT_FEATURE_CQM_RSSI_LIST))
 		return;
 
-	if (netdev->operational && netdev->rssi_levels_num > 0) {
+	if (netdev->operational && (netdev->rssi_levels_num > 0 ||
+					netdev->cqm_poll_fallback)) {
 		if (netdev->rssi_poll_timeout)
 			return;
 

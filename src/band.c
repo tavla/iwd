@@ -1426,7 +1426,7 @@ static const char *const oper_class_eu_codes[] = {
 	"AL", "AM", "AT", "AZ", "BA", "BE", "BG", "BY", "CH", "CY", "CZ", "DE",
 	"DK", "EE", "EL", "ES", "FI", "FR", "GE", "HR", "HU", "IE", "IS", "IT",
 	"LI", "LT", "LU", "LV", "MD", "ME", "MK", "MT", "NL", "NO", "PL", "PT",
-	"RO", "RS", "RU", "SE", "SI", "SK", "TR", "UA", "UK"
+	"RO", "RS", "RU", "SE", "SI", "SK", "TR", "UA", "UK", "GB"
 };
 
 /* Annex E, table E-1 */
